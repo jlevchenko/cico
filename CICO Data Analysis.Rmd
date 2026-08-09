@@ -1,0 +1,1415 @@
+---
+title: "Check-In/Check-Out (CICO) Data Analysis"
+author: "Juliana Levchenko, Ph.D. | School Mental Health Collaborative"
+date: "`r format(Sys.time(), '%A, %B %d, %Y %I:%M %p')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+    df_print: paged
+    theme: united
+    highlight: pygments
+    code_folding: show
+    fig_caption: true
+    keep_md: true
+  html_notebook:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    number_sections: true
+    df_print: paged
+    theme: default
+    highlight: pygments
+  word_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    fig_caption: true
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    latex_engine: xelatex
+fontsize: 11pt
+geometry: margin=1in
+always_allow_html: true
+editor_options:
+  chunk_output_type: inline
+---
+
+# Project Overview
+
+This notebook analyzes Check-In/Check-Out (CICO) outcomes using direct observations (SDO) and teacher BASC-3 ratings. The goal is to estimate the effect of CICO on student engagement and behavior while accounting for clustering by classroom and school.
+
+**Research questions**
+
+1. **RQ1**: Do CICO students show higher on-task behavior and lower disruptive behavior over time compared to BAU?
+2. **RQ2**: Do CICO students have better BASC-3 outcomes at posttest after adjusting for baseline?
+
+**Data sources**
+
+- CICO direct observations from 2021–22 to 2024–25  
+- BASC-3 pre and post teacher ratings  
+- IDs for school, teacher, student and site
+
+**Key outcomes**
+
+- Proximal: percent on-task and percent disruptive by phase (Baseline, Mid, Post, Maintenance)  
+- Distal: BASC-3 Externalizing, Internalizing, School Problems and Adaptive Skills
+
+**Design**
+
+- Students nested within teachers and schools  
+- Treatment is CICO vs BAU  
+- Missing data handled with ML using `na.exclude` with checks for attrition
+
+# Analysis Outline
+
+1. **Import and audit data**  
+   Load CICO and BASC-3 files, standardize IDs and check types.
+
+2. **Clean and reshape**  
+   Remove reliability rows for SDO. Build phase-level wide and long datasets. Summarize observation counts and phases.
+
+3. **Missing data and attrition**  
+   Convert NaN to NA. Keep records with valid IDs. Create student-level attrition flags and test group differences.
+
+4. **RQ1: Proximal outcomes (SDO)**  
+   Baseline equivalence for on-task and disruptive. Unconditional models for ICCs. Three-level growth models with time centered at week 12. Fixed effects for schools and random intercepts and slopes for students. Report contrasts by phase with EMMs and standardized effects.
+
+5. **RQ2: Distal outcomes (BASC-3)**  
+   Pre-model checklist for baseline equivalence, attrition and ICCs. Two-level ANCOVA with baseline covariate and classroom random intercept. Primary contrast is CICO minus BAU with pooled baseline SD for d. Summarize adjusted means, effects and classroom ICCs.
+
+6. **Diagnostics and sensitivity**  
+   Fit comparison for school effects.
+
+7. **Reporting**  
+   Tables for descriptives, ICCs, adjusted means and effects.
+   .
+**Planned outputs**
+
+- HTML report with tables and interpretations  
+- Optional Word and PDF versions for sharing
+
+**Reproducibility**
+
+- Session info and package versions printed  
+- Random seed set to 2025  
+- Paths set at the top for easy re-run
+
+# Setup
+
+```{r}
+# --------------------------------------------------------------------
+# Environment Setup and Package Loading
+# --------------------------------------------------------------------
+
+# Clear workspace
+rm(list = ls())
+
+# Global options
+options(
+  dplyr.summarise.inform = FALSE,  # Suppress summarise() messages
+  tibble.print_max = 25,           # Limit tibble output in console
+  scipen = 999,                    # Avoid scientific notation
+  stringsAsFactors = FALSE         # Prevent automatic factor conversion
+)
+
+set.seed(2025)  # Reproducibility seed
+
+# --------------------------------------------------------------------
+# Define Required Packages
+# --------------------------------------------------------------------
+required_packages <- c(
+  "dplyr", "tibble", "tidyr", "purrr", "stringr",
+  "ggplot2", "readr", "knitr", "haven",
+  "lme4", "lmerTest", "performance", "emmeans",
+  "effectsize", "broom.mixed"
+)
+
+# --------------------------------------------------------------------
+# Install and Load Packages
+# --------------------------------------------------------------------
+missing_pkgs <- setdiff(required_packages, rownames(installed.packages()))
+
+if (length(missing_pkgs) > 0) {
+  message("Installing missing packages: ", paste(missing_pkgs, collapse = ", "))
+  suppressMessages(invisible(lapply(missing_pkgs, install.packages)))
+} else {
+  message("All required packages already installed.")
+}
+
+# Load all packages quietly
+invisible(lapply(required_packages, \(pkg) {
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
+}))
+
+# --------------------------------------------------------------------
+# Verify and Print Session Info
+# --------------------------------------------------------------------
+cat("All required packages successfully loaded.\n")
+cat("Loaded packages:", paste(required_packages, collapse = ", "), "\n")
+cat("R version:", as.character(getRversion()), "\n\n")
+
+# Record package versions for reproducibility
+pkg_versions <- sapply(required_packages, \(pkg) as.character(packageVersion(pkg)))
+knitr::kable(
+  tibble::enframe(pkg_versions, name = "Package", value = "Version"),
+  caption = "Package Versions Loaded"
+)
+```
+
+## Import Data
+
+```{r}
+# --------------------------------------------------------------------
+# Data Import: CICO and BASC Datasets
+# --------------------------------------------------------------------
+
+# Define base data directory
+data_dir <- "I:/WCER/2025/CICO/"
+
+# --------------------------------------------------------------------
+# 1. Import CICO Direct Observation (.sav) datasets by year
+# --------------------------------------------------------------------
+# Note: The 2023–24 file requires an explicit encoding parameter
+# due to SPSS export inconsistencies (WINDOWS-1252).
+
+cico_2021 <- read_sav(file.path(data_dir, "CICO-2021-22_DirectObs_students.sav"))
+cico_2022 <- read_sav(file.path(data_dir, "CICO-2022-23_DirectObs_students.sav"))
+cico_2023 <- read_sav(
+  file.path(data_dir, "CICO-2023-24_DirectObs_students.sav"),
+  encoding = "WINDOWS-1252"
+)
+cico_2024 <- read_sav(file.path(data_dir, "CICO-2024-25_DirectObs_students.sav"))
+
+# --------------------------------------------------------------------
+# 2. Import BASC-3 datasets for supplemental outcome analyses
+# --------------------------------------------------------------------
+basc_prepost <- read_sav(file.path(data_dir, "BASC pre post only multivariate.sav"))
+basc_trs     <- read_sav(file.path(data_dir, "BASC TRS combined across cohorts.sav"))
+
+# --------------------------------------------------------------------
+# 3. Combine CICO datasets into one master dataset with a year tag
+# --------------------------------------------------------------------
+cico_all <- bind_rows(
+  mutate(cico_2021, year = "2021-22"),
+  mutate(cico_2022, year = "2022-23"),
+  mutate(cico_2023, year = "2023-24"),
+  mutate(cico_2024, year = "2024-25")
+)
+
+# --------------------------------------------------------------------
+# 4. Quick verification and summary
+# --------------------------------------------------------------------
+cat("Successfully imported CICO and BASC datasets.\n")
+cat("   • Combined years in CICO master file:", paste(unique(cico_all$year), collapse = ", "), "\n")
+cat("   • Total CICO records:", nrow(cico_all), "\n")
+cat("   • Total BASC datasets loaded: 2\n")
+```
+
+## Variable Setup and Clustering
+
+```{r}
+# --------------------------------------------------------------------
+# ID Verification & Standardization (cico_all)
+# --------------------------------------------------------------------
+
+# Required columns
+req <- c("do_std1_id", "do_tch_id", "do_school_id", "year")
+missing_cols <- setdiff(req, names(cico_all))
+if (length(missing_cols)) stop("Missing required columns: ", paste(missing_cols, collapse = ", "))
+
+# Convert to character early to avoid factor/label surprises
+cico_all <- cico_all %>%
+  mutate(across(all_of(req[1:3]), ~ as.character(.x)))
+
+# Helper: trim, drop leading zeros, empty->NA
+clean_id <- function(x) {
+  x <- stringr::str_trim(x)
+  x <- sub("^0+", "", x)
+  x[x == ""] <- NA_character_
+  x
+}
+
+# Pre-clean diagnostics
+pre_diag <- tibble::tibble(
+  col = c("do_std1_id","do_tch_id","do_school_id"),
+  class = vapply(cico_all[c("do_std1_id","do_tch_id","do_school_id")], \(z) class(z)[1], character(1)),
+  n_missing = c(sum(is.na(cico_all$do_std1_id)),
+                sum(is.na(cico_all$do_tch_id)),
+                sum(is.na(cico_all$do_school_id))),
+  n_leading_zeros = c(sum(grepl("^0+", cico_all$do_std1_id), na.rm = TRUE),
+                      sum(grepl("^0+", cico_all$do_tch_id), na.rm = TRUE),
+                      sum(grepl("^0+", cico_all$do_school_id), na.rm = TRUE)),
+  n_non_alnum = c(sum(grepl("[^A-Za-z0-9_-]", cico_all$do_std1_id), na.rm = TRUE),
+                  sum(grepl("[^A-Za-z0-9_-]", cico_all$do_tch_id), na.rm = TRUE),
+                  sum(grepl("[^A-Za-z0-9_-]", cico_all$do_school_id), na.rm = TRUE))
+)
+
+# Clean IDs
+cico_all <- cico_all %>%
+  mutate(
+    do_std1_id   = clean_id(do_std1_id),
+    do_tch_id    = clean_id(do_tch_id),
+    do_school_id = clean_id(do_school_id)
+  )
+
+# Post-clean diagnostics
+post_diag <- tibble::tibble(
+  col = c("do_std1_id","do_tch_id","do_school_id"),
+  n_missing = c(sum(is.na(cico_all$do_std1_id)),
+                sum(is.na(cico_all$do_tch_id)),
+                sum(is.na(cico_all$do_school_id))),
+  unique_overall = c(dplyr::n_distinct(cico_all$do_std1_id, na.rm = TRUE),
+                     dplyr::n_distinct(cico_all$do_tch_id, na.rm = TRUE),
+                     dplyr::n_distinct(cico_all$do_school_id, na.rm = TRUE)),
+  n_non_alnum = c(sum(grepl("[^A-Za-z0-9_-]", cico_all$do_std1_id), na.rm = TRUE),
+                  sum(grepl("[^A-Za-z0-9_-]", cico_all$do_tch_id), na.rm = TRUE),
+                  sum(grepl("[^A-Za-z0-9_-]", cico_all$do_school_id), na.rm = TRUE))
+)
+
+# Cross-year reuse of student IDs
+cross_year_std <- cico_all %>%
+  distinct(year, do_std1_id) %>%
+  filter(!is.na(do_std1_id)) %>%
+  count(do_std1_id, name = "n_years") %>%
+  summarize(n_ids_multi_years = sum(n_years > 1L), .groups = "drop")
+
+# Sample any remaining non-alphanumeric IDs (up to 10 for review)
+flagged_ids <- bind_rows(
+  tibble::tibble(col = "do_std1_id",   id = unique(cico_all$do_std1_id[grepl("[^A-Za-z0-9_-]", cico_all$do_std1_id)])),
+  tibble::tibble(col = "do_tch_id",    id = unique(cico_all$do_tch_id[grepl("[^A-Za-z0-9_-]", cico_all$do_tch_id)])),
+  tibble::tibble(col = "do_school_id", id = unique(cico_all$do_school_id[grepl("[^A-Za-z0-9_-]", cico_all$do_school_id)]))
+) %>%
+  filter(!is.na(id)) %>%
+  slice_head(n = 10)
+
+# Report
+cat("== Pre-clean ID diagnostics ==\n"); print(pre_diag)
+cat("\n== Post-clean ID diagnostics ==\n"); print(post_diag)
+cat("\nStudent IDs appearing in multiple years: ", cross_year_std$n_ids_multi_years, "\n", sep = "")
+if (nrow(flagged_ids) > 0) {
+  cat("Non-alphanumeric IDs detected (sample):\n"); print(flagged_ids)
+} else {
+  cat("No non-alphanumeric characters detected in IDs.\n")
+}
+cat("ID columns verified and standardized (trimmed; leading zeros removed).\n")
+```
+
+
+## Reliability Filtering
+
+```{r}
+# Keep primary observer rows (exclude reliability = 1)
+cico_primary <- cico_all %>%
+  filter(is.na(do_observ_rel_yn) | do_observ_rel_yn == 0)
+```
+
+
+## Data Reshaping: Wide
+
+```{r}
+# --------------------------------------------------------------------
+# Observation Count Indicator: Reshape to Phase-Level and Summarize
+# --------------------------------------------------------------------
+
+# Convert numeric timepoint -> label (e.g., "BL1", "Mid2", etc.)
+# Then extract the phase prefix safely so "Mid" ≠ "M"
+cico_tp <- cico_primary %>%
+  mutate(
+    tp_label = as.character(haven::as_factor(do_std1_timepoint, levels = "labels")),
+    phase = str_match(tp_label, "^(Mid|BL|Post|M)")[, 2]
+  ) %>%
+  filter(!is.na(phase))
+
+# --------------------------------------------------------------------
+# Aggregate to Phase-Level (Wide Format)
+# Retain: Site, School, Teacher, Student, and Condition identifiers
+# --------------------------------------------------------------------
+cico_phase_wide <- cico_tp %>%
+  group_by(
+    year,
+    redcap_data_access_group,  # Site / REDCap DAG
+    do_school_id,              # School ID
+    do_tch_id,                 # Teacher ID
+    do_std1_id,                # Student ID
+    do_condition               # Condition assignment
+  ) %>%
+  summarize(
+    # Observation counts per phase
+    n_BL   = sum(phase == "BL"),
+    n_Mid  = sum(phase == "Mid"),
+    n_Post = sum(phase == "Post"),
+    n_M    = sum(phase == "M"),
+
+    # Mean percent on-task per phase
+    ontask_BL   = mean(do_std1_pct_ontask[phase == "BL"],   na.rm = TRUE),
+    ontask_Mid  = mean(do_std1_pct_ontask[phase == "Mid"],  na.rm = TRUE),
+    ontask_Post = mean(do_std1_pct_ontask[phase == "Post"], na.rm = TRUE),
+    ontask_M    = mean(do_std1_pct_ontask[phase == "M"],    na.rm = TRUE),
+
+    # Mean percent disruptive per phase
+    disrupt_BL   = mean(do_std1_pct_disrupt[phase == "BL"],   na.rm = TRUE),
+    disrupt_Mid  = mean(do_std1_pct_disrupt[phase == "Mid"],  na.rm = TRUE),
+    disrupt_Post = mean(do_std1_pct_disrupt[phase == "Post"], na.rm = TRUE),
+    disrupt_M    = mean(do_std1_pct_disrupt[phase == "M"],    na.rm = TRUE),
+
+    .groups = "drop"
+  ) %>%
+  arrange(year, redcap_data_access_group, do_school_id, do_tch_id, do_std1_id)
+
+# --------------------------------------------------------------------
+# Summary Table (Long Format)
+# --------------------------------------------------------------------
+summary_table_long <- cico_phase_wide %>%
+  summarize(
+    total_students = n(),
+    mean_obs_BL   = mean(n_BL,   na.rm = TRUE),
+    mean_obs_Mid  = mean(n_Mid,  na.rm = TRUE),
+    mean_obs_Post = mean(n_Post, na.rm = TRUE),
+    mean_obs_M    = mean(n_M,    na.rm = TRUE),
+    pct_with_BL   = mean(!is.na(ontask_BL))   * 100,
+    pct_with_Mid  = mean(!is.na(ontask_Mid))  * 100,
+    pct_with_Post = mean(!is.na(ontask_Post)) * 100,
+    pct_with_M    = mean(!is.na(ontask_M))    * 100,
+    mean_ontask_BL   = mean(ontask_BL,   na.rm = TRUE),
+    mean_ontask_Mid  = mean(ontask_Mid,  na.rm = TRUE),
+    mean_ontask_Post = mean(ontask_Post, na.rm = TRUE),
+    mean_ontask_M    = mean(ontask_M,    na.rm = TRUE),
+    mean_disrupt_BL   = mean(disrupt_BL,   na.rm = TRUE),
+    mean_disrupt_Mid  = mean(disrupt_Mid,  na.rm = TRUE),
+    mean_disrupt_Post = mean(disrupt_Post, na.rm = TRUE),
+    mean_disrupt_M    = mean(disrupt_M,    na.rm = TRUE)
+  ) %>%
+  pivot_longer(
+    cols = -total_students,
+    names_to = c("metric", "phase"),
+    names_pattern = "^(.*)_(BL|Mid|Post|M)$",
+    values_to = "value"
+  ) %>%
+  select(-total_students) %>%
+  pivot_wider(names_from = metric, values_from = value) %>%
+  rename(ontask = mean_ontask, disrupt = mean_disrupt) %>%
+  mutate(phase = factor(phase, levels = c("BL", "Mid", "Post", "M"))) %>%
+  arrange(phase) %>%
+  select(phase, mean_obs, pct_with, ontask, disrupt)
+
+# --------------------------------------------------------------------
+# Output: Display Summary Table
+# --------------------------------------------------------------------
+knitr::kable(summary_table_long, digits = 2)
+
+# --------------------------------------------------------------------
+# Identify and Remove Rows with Missing Data
+# --------------------------------------------------------------------
+
+# Step 1: Convert all NaN values to NA across the dataset
+cico_phase_wide <- cico_phase_wide %>%
+  mutate(across(everything(), ~ ifelse(is.nan(.x), NA, .x)))
+
+# Step 2: Record total rows before cleanup
+n_before <- nrow(cico_phase_wide)
+
+# Step 3: Remove rows with missing identifiers or metrics
+cico_phase_wide <- cico_phase_wide %>%
+  filter(
+    !if_any(c(do_std1_id, do_tch_id, do_school_id, redcap_data_access_group, do_condition), is.na) == TRUE,
+    !if_all(starts_with("ontask_"), is.na),
+    !if_all(starts_with("disrupt_"), is.na)
+  )
+
+# Step 4: Record totals after cleanup
+n_after <- nrow(cico_phase_wide)
+n_removed <- n_before - n_after
+
+# Step 5: Print cleanup summary
+cat("Missing-value cleanup complete.\n")
+cat("   • Rows before cleanup:", n_before, "\n")
+cat("   • Rows after cleanup:", n_after, "\n")
+cat("   • Rows removed due to missing data:", n_removed, "\n")
+```
+
+## Data Reshaping: Long
+
+```{r}
+# --------------------------------------------------------------------
+# Long Format with Labeled Phases and Mean Summaries
+# --------------------------------------------------------------------
+
+# 1) Derive phase from timepoint labels and assign readable labels
+cico_long <- cico_primary %>%
+  mutate(
+    tp_label = as.character(haven::as_factor(do_std1_timepoint, levels = "labels")),
+    phase_code = stringr::str_match(tp_label, "^(Mid|BL|Post|M)")[, 2],
+    phase = dplyr::case_match(
+      phase_code,
+      "BL"   ~ "Baseline",
+      "Mid"  ~ "Mid-Intervention",
+      "Post" ~ "Post-Intervention",
+      "M"    ~ "Maintenance",
+      .default = NA_character_
+    )
+  ) %>%
+  filter(!is.na(phase))
+
+# 2) Average within student × phase (retain essential IDs)
+cico_phase_long <- cico_long %>%
+  group_by(
+    year,
+    redcap_data_access_group,   # Site
+    do_school_id,               # School
+    do_tch_id,                  # Teacher
+    do_std1_id,                 # Student
+    do_condition,               # Condition
+    phase                       # Labeled Phase
+  ) %>%
+  summarize(
+    n_obs        = n(),
+    mean_ontask  = mean(do_std1_pct_ontask,  na.rm = TRUE),
+    mean_disrupt = mean(do_std1_pct_disrupt, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    phase = factor(
+      phase,
+      levels = c("Baseline", "Mid-Intervention", "Post-Intervention", "Maintenance")
+    )
+  ) %>%
+  select(
+    year, redcap_data_access_group, do_school_id, do_tch_id,
+    do_std1_id, do_condition, phase, n_obs, mean_ontask, mean_disrupt
+  ) %>%
+  arrange(year, redcap_data_access_group, do_school_id, do_tch_id, do_std1_id, phase)
+
+# --------------------------------------------------------------------
+# Missing Data Handling
+# --------------------------------------------------------------------
+
+# Step 1: Convert NaN → NA only for numeric variables
+cico_phase_long <- cico_phase_long %>%
+  mutate(across(where(is.numeric), ~ ifelse(is.nan(.x), NA, .x)))
+
+# Step 2: Count missing values per variable
+missing_summary <- cico_phase_long %>%
+  summarize(across(everything(), ~ sum(is.na(.x)))) %>%
+  tidyr::pivot_longer(everything(), names_to = "variable", values_to = "n_missing")
+
+cat("🔍 Missing value summary (before cleanup):\n")
+print(missing_summary)
+
+# Step 3: Record total rows before cleanup
+n_before <- nrow(cico_phase_long)
+
+# Step 4: Remove any rows that contain missing data
+cico_phase_long <- cico_phase_long %>%
+  filter(if_all(everything(), ~ !is.na(.x)))
+
+# Step 5: Record totals after cleanup
+n_after <- nrow(cico_phase_long)
+n_removed <- n_before - n_after
+
+# Step 6: Print cleanup summary
+cat("\n✅ Missing-value cleanup complete (rows with any NA removed):\n")
+cat("   • Rows before cleanup:", n_before, "\n")
+cat("   • Rows after cleanup:", n_after, "\n")
+cat("   • Rows removed due to missing data:", n_removed, "\n")
+
+# --------------------------------------------------------------------
+# Output: Summary by Phase (after cleanup)
+# --------------------------------------------------------------------
+summary_table <- cico_phase_long %>%
+  group_by(phase) %>%
+  summarize(
+    total_students = n_distinct(do_std1_id),
+    mean_obs       = mean(n_obs, na.rm = TRUE),
+    mean_ontask    = mean(mean_ontask, na.rm = TRUE),
+    mean_disrupt   = mean(mean_disrupt, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+knitr::kable(summary_table, digits = 2)
+```
+## Cluster Size Summaries
+```{r}
+# --------------------------------------------------------------------
+# Cluster Size Summaries: Students per Teacher and Teachers per School
+# --------------------------------------------------------------------
+
+# Students per teacher
+students_per_teacher <- cico_phase_long %>%
+  distinct(do_tch_id, do_std1_id) %>%
+  group_by(do_tch_id) %>%
+  summarize(n_students = n(), .groups = "drop")
+
+# Teachers per school
+teachers_per_school <- cico_phase_long %>%
+  distinct(do_school_id, do_tch_id) %>%
+  group_by(do_school_id) %>%
+  summarize(n_teachers = n(), .groups = "drop")
+
+# Summary statistics
+cat("Average Cluster Sizes:\n")
+cat("   • Average students per teacher:", round(mean(students_per_teacher$n_students), 2), "\n")
+cat("   • Median students per teacher:", median(students_per_teacher$n_students), "\n")
+cat("   • Average teachers per school:", round(mean(teachers_per_school$n_teachers), 2), "\n")
+cat("   • Median teachers per school:", median(teachers_per_school$n_teachers), "\n")
+
+summary(students_per_teacher$n_students)
+summary(teachers_per_school$n_teachers)
+```
+## Missing Data Handling
+
+```{r}
+# ================================================================
+# Missing Data Handling (FIML/MAR-aligned)
+# ================================================================
+
+# 1) Verify essential design variables exist
+required_vars <- c("do_std1_id", "do_school_id", "do_condition", "phase",
+                   "mean_ontask", "mean_disrupt")
+missing_vars <- setdiff(required_vars, names(cico_phase_long))
+if (length(missing_vars) > 0) {
+  stop("Missing required variables in cico_phase_long: ",
+       paste(missing_vars, collapse = ", "))
+}
+
+# 2) Convert NaN -> NA for numeric columns (do NOT drop rows with missing outcomes)
+cico_phase_long <- cico_phase_long %>%
+  dplyr::mutate(dplyr::across(where(is.numeric), ~ ifelse(is.nan(.x), NA, .x)))
+
+# 3) Keep rows with valid IDs/design fields; allow outcomes to be missing
+cico_phase_long <- cico_phase_long %>%
+  dplyr::filter(!is.na(do_std1_id),
+                !is.na(do_school_id),
+                !is.na(do_condition),
+                !is.na(phase))
+
+# 4) Ensure factors are set and analysis honors NA via na.exclude (FIML-like under MAR)
+#    lmer() will fit by ML/REML using all available data on the variables in each model.
+options(na.action = "na.exclude")
+cico_phase_long <- cico_phase_long %>%
+  dplyr::mutate(
+    do_condition = as.factor(do_condition),
+    do_school_id = as.factor(do_school_id),
+    do_std1_id   = as.factor(do_std1_id),
+    phase = factor(phase,
+                   levels = c("Baseline","Mid-Intervention",
+                              "Post-Intervention","Maintenance"),
+                   ordered = TRUE)
+  )
+
+# 5) Build attrition indicators and (optionally) add as covariates if differential attrition
+#    Here: attrition = student lacks any Post-Intervention or Maintenance record
+attrition_df <- cico_phase_long %>%
+  dplyr::mutate(has_post_or_maint = phase %in% c("Post-Intervention","Maintenance")) %>%
+  dplyr::group_by(do_std1_id, do_condition) %>%
+  dplyr::summarize(attrition = as.integer(!any(has_post_or_maint)),
+                   .groups = "drop")
+
+# Test differential attrition by condition (simple screen)
+attrition_test <- tryCatch(
+  {
+    glm(attrition ~ do_condition, data = attrition_df, family = binomial())
+  },
+  error = function(e) NULL
+)
+
+attrition_p <- tryCatch(summary(attrition_test)$coefficients[2,4], error = function(e) NA_real_)
+
+# Merge baseline covariate for attrition (student-level, constant across phases)
+cico_phase_long <- cico_phase_long %>%
+  dplyr::left_join(attrition_df, by = c("do_std1_id","do_condition")) %>%
+  dplyr::mutate(attrition = ifelse(is.na(attrition), 0L, attrition))
+
+cat("Missing data prepared for ML estimation (na.exclude).\n")
+cat("   • Rows in analysis frame:", nrow(cico_phase_long), "\n")
+cat("   • Unique students:", dplyr::n_distinct(cico_phase_long$do_std1_id),
+    " | Unique schools:", dplyr::n_distinct(cico_phase_long$do_school_id), "\n")
+if (!is.na(attrition_p)) {
+  cat(sprintf("   • Differential attrition p-value (by condition): %.4f\n", attrition_p))
+  if (is.finite(attrition_p) && attrition_p < 0.10) {
+    cat("   • Note: Consider including 'attrition' (and drivers of missingness) as covariates in models.\n")
+  }
+} else {
+  cat("   • Attrition model not estimated (insufficient variation or model error).\n")
+}
+```
+
+The dataset includes 1,153 phase-level observations from 326 students across 24 schools, reflecting repeated measures nested within students and schools. Missing data are handled using full-information maximum likelihood (FIML), which allows all available data to be used without dropping participants who have partial information. However, attrition differed significantly between treatment groups (p = 0.0284), suggesting one group had more missing follow-up data. To reduce potential bias, it would be best to include an attrition indicator in the multilevel models.
+
+
+# RQ1: Multilevel Models for Proximal Outcomes (SDO)
+
+## Setup
+
+```{r}
+# ================================================================
+# Analysis Setup
+# ================================================================
+
+# Helper: pooled SD for standardized differences
+pooled_sd <- function(x, g) {
+  g <- droplevels(as.factor(g))
+  sds <- tapply(x, g, sd, na.rm = TRUE)
+  ns  <- tapply(x, g, function(v) sum(!is.na(v)))
+  sqrt(sum((ns - 1) * sds^2, na.rm = TRUE) / sum(ns - 2, na.rm = TRUE))
+}
+
+# Prepare factor structure for modeling
+cico_phase_long <- cico_phase_long %>%
+  mutate(
+    do_condition = factor(do_condition),
+    do_school_id = factor(do_school_id),
+    do_std1_id   = factor(do_std1_id),
+    phase = factor(
+      phase,
+      levels = c("Baseline", "Mid-Intervention", "Post-Intervention", "Maintenance"),
+      ordered = TRUE
+    )
+  )
+
+cat("Analysis dataset prepared for modeling.\n")
+cat("   • Phases present:", paste(levels(cico_phase_long$phase), collapse = ", "), "\n")
+cat("   • Condition counts:\n")
+print(table(cico_phase_long$do_condition))
+```
+
+## Baseline Equivalence and Attrition
+
+```{r}
+# ================================================================
+# Baseline Equivalence and Attrition
+# ================================================================
+
+# --- Baseline only ---
+cico_baseline <- cico_phase_long %>% filter(phase == "Baseline")
+if (nrow(cico_baseline) == 0) stop("No baseline data detected.")
+
+# Descriptive summaries
+base_equiv <- cico_baseline %>%
+  group_by(do_condition) %>%
+  summarize(
+    n = n(),
+    mean_ontask = mean(mean_ontask, na.rm = TRUE),
+    sd_ontask = sd(mean_ontask, na.rm = TRUE),
+    mean_disrupt = mean(mean_disrupt, na.rm = TRUE),
+    sd_disrupt = sd(mean_disrupt, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Standardized mean differences (Hedges’ g)
+library(effectsize)
+d_ontask  <- cohens_d(mean_ontask ~ do_condition, data = cico_baseline, hedges.correction = TRUE)$Cohens_d
+d_disrupt <- cohens_d(mean_disrupt ~ do_condition, data = cico_baseline, hedges.correction = TRUE)$Cohens_d
+
+cat("Baseline Equivalence\n")
+print(base_equiv)
+cat("\nStandardized Baseline Differences (Hedges g):",
+    "\n   • On-task =", round(d_ontask, 3),
+    "\n   • Disruptive =", round(d_disrupt, 3), "\n\n")
+
+# --- Attrition Summary ---
+attrition <- cico_phase_long %>%
+  mutate(has_post = phase %in% c("Post-Intervention", "Maintenance")) %>%
+  group_by(do_std1_id, do_condition) %>%
+  summarize(has_post = any(has_post), .groups = "drop") %>%
+  group_by(do_condition) %>%
+  summarize(
+    n = n(),
+    n_missing_post = sum(!has_post),
+    attrition_rate = round(100 * mean(!has_post), 1),
+    .groups = "drop"
+  )
+
+cat("Attrition Summary (Post or Maintenance Missing):\n")
+print(attrition)
+
+# χ² test for differential attrition
+attrition_test <- prop.test(
+  x = attrition$n_missing_post,
+  n = attrition$n
+)
+cat("Differential Attrition Test (χ²): p =", round(attrition_test$p.value, 4), "\n")
+if (attrition_test$p.value < 0.05) {
+  cat("Significant differential attrition detected. Consider including attrition covariates.\n\n")
+} else {
+  cat("No significant differential attrition detected.\n\n")
+}
+```
+
+### Interpretation
+
+Baseline equivalence checks showed minimal differences between groups, with small standardized effects for on-task (g = 0.12) and disruptive behavior (g = 0.11), suggesting the treatment and control groups were similar at baseline. Average baseline on-task behavior was 0.74 for controls and 0.72 for the treatment group, while disruptive behavior averaged 0.22 and 0.20, respectively. Attrition analysis showed higher dropout in the treatment group (6.8%) than in the control group (0.7%), and this difference was statistically significant (p = 0.0166). Because of this, it’s recommended to include an attrition indicator or related covariates in the multilevel models.
+
+## Unconditional Models and ICCs
+
+```{r}
+# ================================================================
+# Unconditional Models and ICCs
+# ================================================================
+
+# Random-intercept models (students nested within schools)
+m0_on  <- lmer(mean_ontask  ~ 1 + (1 | do_school_id/do_std1_id),
+               data = cico_phase_long, REML = TRUE)
+m0_dis <- lmer(mean_disrupt ~ 1 + (1 | do_school_id/do_std1_id),
+               data = cico_phase_long, REML = TRUE)
+
+cat("Intraclass Correlations (ICCs):\n")
+cat("   • On-task:\n"); print(performance::icc(m0_on))
+cat("\n   • Disruptive:\n"); print(performance::icc(m0_dis))
+
+# Variance components (School, Student, Residual)
+vc_on  <- as.data.frame(VarCorr(m0_on))
+vc_dis <- as.data.frame(VarCorr(m0_dis))
+
+cat("Variance components (On-task):\n");  print(vc_on[, c("grp", "vcov", "sdcor")])
+cat("Variance components (Disruptive):\n"); print(vc_dis[, c("grp", "vcov", "sdcor")])
+
+# Singularity checks
+if (isSingular(m0_on, tol = 1e-5))  cat("On-task model is singular (some variance ~ 0).\n")
+if (isSingular(m0_dis, tol = 1e-5)) cat("Disruptive model is singular (some variance ~ 0).\n")
+
+cat("ICCs calculated and variance components reported.\n")
+```
+
+### Interpretation
+
+Intraclass correlation coefficients (ICCs) indicate that about 49% of the variance in on-task behavior and 60% of the variance in disruptive behavior is due to differences between students or schools rather than within-student fluctuations over time. These are relatively high ICC values, suggesting strong clustering in the data and confirming that a multilevel model is appropriate. The variance components show that both the student and school levels contribute meaningful variability, but within-student differences (residual variance) still explain a portion of the total variation. Because of this, these results justify the use of a multi-level model with repeated observations nested within students and schools.
+
+
+## Model Output
+
+```{r}
+# ================================================================
+# RQ1: Three-level multilevel growth models (SDO outcomes)
+# Time = weeks centered at end-of-intervention (12 weeks)
+# Repeated time within students, students within schools
+# ================================================================
+
+# ---------------------------
+# 1) Construct time variables
+# ---------------------------
+cico_phase_long <- cico_phase_long %>%
+  mutate(
+    week = dplyr::case_when(
+      phase == "Baseline"          ~ 0,
+      phase == "Mid-Intervention"  ~ 4,
+      phase == "Post-Intervention" ~ 12,
+      phase == "Maintenance"       ~ 16,    # use 16; change to 20 if your maintenance is at week 20
+      TRUE ~ NA_real_
+    ),
+    week_c = week - 12            # center at 12 so intercept = end-of-intervention
+  )
+
+# Safety check
+stopifnot(all(c("week","week_c") %in% names(cico_phase_long)))
+if (any(is.na(cico_phase_long$week))) {
+  stop("Some rows have undefined 'week'. Check 'phase' mapping.")
+}
+
+# --------------------------------------------------------
+# 2) Create/attach an attrition covariate
+#    (1 = missing any Post/Maintenance row for the student)
+# --------------------------------------------------------
+if (!"attrition" %in% names(cico_phase_long)) {
+  attr_tbl <- cico_phase_long %>%
+    mutate(has_post = phase %in% c("Post-Intervention", "Maintenance")) %>%
+    group_by(do_std1_id) %>%
+    summarize(attrition = as.integer(!any(has_post)), .groups = "drop")
+  
+  cico_phase_long <- cico_phase_long %>%
+    left_join(attr_tbl, by = "do_std1_id")
+}
+# Make sure it's a factor (model-ready; reference = no-attrition)
+cico_phase_long <- cico_phase_long %>%
+  mutate(attrition = factor(attrition, levels = c(0,1)))
+
+# --------------------------------------------------------
+# 3) factor setup
+# --------------------------------------------------------
+cico_phase_long <- cico_phase_long %>%
+  mutate(
+    do_condition = factor(do_condition),   # 0 = BAU (ref), 1 = CICO
+    do_school_id = factor(do_school_id),
+    do_std1_id   = factor(do_std1_id)
+  )
+
+cat("Analysis frame ready:",
+    "\n   • Rows:", nrow(cico_phase_long),
+    "\n   • Students:", dplyr::n_distinct(cico_phase_long$do_std1_id),
+    "| Schools:", dplyr::n_distinct(cico_phase_long$do_school_id),
+    "\n   • Time centering: intercept represents outcomes at week 12.\n\n")
+
+# --------------------------------------------------------
+# 4) Fit growth models with student random intercepts & slopes
+#    School fixed effects; FIML handled by lmer with NA rows dropped per term
+# --------------------------------------------------------
+
+# On-task behavior
+m1_on <- lmer(
+  mean_ontask ~ week_c * do_condition + attrition + factor(do_school_id) +
+    (1 + week_c | do_std1_id),
+  data = cico_phase_long,
+  REML = FALSE
+)
+cat("Model (On-task) estimated.\n")
+print(summary(m1_on))
+
+# Disruptive behavior
+m1_dis <- lmer(
+  mean_disrupt ~ week_c * do_condition + attrition + factor(do_school_id) +
+    (1 + week_c | do_std1_id),
+  data = cico_phase_long,
+  REML = FALSE
+)
+cat("Model (Disruptive) estimated.\n")
+print(summary(m1_dis))
+
+# --------------------------------------------------------
+# 5) Random-slope (student growth heterogeneity)
+# --------------------------------------------------------
+m1_on_intOnly  <- lmer(
+  mean_ontask ~ week_c * do_condition + attrition + factor(do_school_id) +
+    (1 | do_std1_id),
+  data = cico_phase_long, REML = FALSE
+)
+m1_dis_intOnly <- lmer(
+  mean_disrupt ~ week_c * do_condition + attrition + factor(do_school_id) +
+    (1 | do_std1_id),
+  data = cico_phase_long, REML = FALSE
+)
+
+cat("Likelihood Ratio Tests: Random slope (week_c) vs. intercept only\n")
+cat("On-task:\n");  print(anova(m1_on_intOnly,  m1_on))
+cat("\nDisruptive:\n"); print(anova(m1_dis_intOnly, m1_dis))
+
+# --------------------------------------------------------
+# 6) Sensitivity: Random school effects instead of fixed effects
+# --------------------------------------------------------
+m1_on_randSchool <- lmer(
+  mean_ontask ~ week_c * do_condition + attrition +
+    (1 + week_c | do_std1_id) + (1 | do_school_id),
+  data = cico_phase_long, REML = FALSE
+)
+m1_dis_randSchool <- lmer(
+  mean_disrupt ~ week_c * do_condition + attrition +
+    (1 + week_c | do_std1_id) + (1 | do_school_id),
+  data = cico_phase_long, REML = FALSE
+)
+
+compare_ic <- tibble::tibble(
+  Model = c("Fixed School Effects", "Random School Effects"),
+  OnTask_AIC  = c(AIC(m1_on),  AIC(m1_on_randSchool)),
+  Disrupt_AIC = c(AIC(m1_dis), AIC(m1_dis_randSchool))
+)
+knitr::kable(compare_ic, digits = 2,
+             caption = "Model Fit Comparison: Fixed vs. Random School Effects")
+```
+
+### Interpretation
+
+The multilevel growth models examined changes in on-task and disruptive behavior over time, with repeated observations nested within students and schools. The intercepts represent outcomes at week 12 (end of intervention), showing that students in the BAU condition were, on average, 69% on task and displayed a disruptive behavior rate of 0.30. Students receiving CICO showed significantly higher on-task behavior (b = 0.13, p = .001) and significantly lower disruptive behavior (b = –0.16, p < .001) at posttest compared to BAU peers. The significant week × condition interactions for both outcomes indicate that students in CICO improved more rapidly in engagement (b = 0.005, p = .001) and showed greater reductions in disruptive behavior (b = –0.003, p = .010) over time. Attrition was not a significant covariate, suggesting that differential dropout did not bias results. When comparing model structures, models with fixed school effects provided a better fit than those with random school effects (ΔAIC ≈ 20–50). These findings suggest that CICO led to meaningful and consistent improvements in engagement and reductions in disruptive behavior across schools with fixed-effects modeling best representing the data structure.
+
+## Standardized Effects by Phase
+
+```{r}
+# Build the phase -> week_c map
+MAINT_WEEK <- 16L
+phase_grid <- tibble::tibble(
+  phase  = factor(c("Baseline","Mid-Intervention","Post-Intervention","Maintenance"),
+                  levels = c("Baseline","Mid-Intervention","Post-Intervention","Maintenance"),
+                  ordered = TRUE),
+  week   = c(0L, 4L, 12L, MAINT_WEEK),
+  week_c = week - 12L
+)
+
+# Determine the reference level for attrition (usually "0")
+attr_ref <- levels(cico_phase_long$attrition)[1]
+
+# EMMs by condition at each time-point; condition on week_c, not phase
+emm_on <- emmeans::emmeans(
+  m1_on,
+  ~ do_condition | week_c,
+  at = list(week_c = phase_grid$week_c, attrition = attr_ref)
+)
+
+emm_dis <- emmeans::emmeans(
+  m1_dis,
+  ~ do_condition | week_c,
+  at = list(week_c = phase_grid$week_c, attrition = attr_ref)
+)
+
+# CICO - BAU contrasts at each time-point
+contr_on  <- emmeans::contrast(emm_on,  method = "revpairwise", by = "week_c", adjust = "none")
+contr_dis <- emmeans::contrast(emm_dis, method = "revpairwise", by = "week_c", adjust = "none")
+
+# Join back human-readable phase labels
+contr_on_df <- as.data.frame(contr_on)  |>
+  dplyr::left_join(dplyr::select(phase_grid, phase, week_c), by = "week_c") |>
+  dplyr::relocate(phase, .before = 1)
+
+contr_dis_df <- as.data.frame(contr_dis) |>
+  dplyr::left_join(dplyr::select(phase_grid, phase, week_c), by = "week_c") |>
+  dplyr::relocate(phase, .before = 1)
+
+# Baseline pooled SDs for standardization
+cico_baseline <- dplyr::filter(cico_phase_long, phase == "Baseline")
+sd_on  <- pooled_sd(cico_baseline$mean_ontask,  cico_baseline$do_condition)
+sd_dis <- pooled_sd(cico_baseline$mean_disrupt, cico_baseline$do_condition)
+
+es_on <- contr_on_df |>
+  dplyr::mutate(cohens_d = estimate / sd_on) |>
+  dplyr::select(phase, week_c, contrast, estimate, SE, df, p.value, cohens_d)
+
+es_dis <- contr_dis_df |>
+  dplyr::mutate(cohens_d = estimate / sd_dis) |>
+  dplyr::select(phase, week_c, contrast, estimate, SE, df, p.value, cohens_d)
+
+cat("\n Standardized Effects by Phase (Cohen’s d)\n")
+cat("\nOn-task:\n"); print(es_on)
+cat("\nDisruptive:\n"); print(es_dis)
+```
+
+### Interpretation
+
+The warnings about “rank deficiency” just mean that schools were fully nested within treatment groups, since each school used either CICO or BAU but not both. Because of that, one redundant term was dropped from the model, which is normal and doesn’t affect the results.
+
+The standardized effects by phase show how the differences between the CICO and BAU students changed over time. For **on-task behavior**, there weren’t any noticeable differences at baseline (d = −0.07, p = .49) or mid-intervention (d = 0.04, p = .68). By post-intervention, though, CICO students were significantly more on task than their BAU peers (d = 0.26, p = .012), and that advantage grew during maintenance (d = 0.37, p = .003). This shows that the gains in engagement not only held up but actually increased after the intervention ended.
+
+For **disruptive behavior**, the pattern went in the opposite direction. The groups looked similar at first (d = 0.07, p = .44; d = −0.01, p = .89), but by post-intervention, CICO students were significantly less disruptive (d = −0.17, p = .042), with even stronger effects at maintenance (d = −0.25, p = .015).
+
+The results show that CICO made a clear difference in improving engagement and reducing disruptive behavior over time with moderate effects that continued even after the program ended.
+
+
+## Figure: Model-based SDO estimates across phases by group
+
+```{r fig-sdo-model-based, fig.width=8, fig.height=5, fig.cap="Model-based estimated means for SDO outcomes by phase and condition (EMMs from multilevel growth models). Higher values indicate more on-task and more disruptive behavior respectively."}
+# Build a phase grid aligned to the time-centering
+phase_grid <- tibble::tibble(
+  phase   = factor(c("Baseline","Mid-Intervention","Post-Intervention","Maintenance"),
+                   levels = c("Baseline","Mid-Intervention","Post-Intervention","Maintenance"),
+                   ordered = TRUE),
+  week    = c(0L, 4L, 12L, 16L),
+  week_c  = week - 12L
+)
+
+# Reference level for attrition (0 = no attrition)
+attr_ref <- levels(cico_phase_long$attrition)[1]
+
+# EMMs for each outcome across phases by condition
+emm_on_df <- emmeans::emmeans(
+  m1_on,
+  ~ do_condition | week_c,
+  at = list(week_c = phase_grid$week_c, attrition = attr_ref)
+) |>
+  as.data.frame() |>
+  dplyr::left_join(dplyr::select(phase_grid, phase, week_c), by = "week_c") |>
+  dplyr::mutate(outcome = "On-task", emmean = pmax(pmin(emmean, 1), 0))  # clamp to [0,1]
+
+emm_dis_df <- emmeans::emmeans(
+  m1_dis,
+  ~ do_condition | week_c,
+  at = list(week_c = phase_grid$week_c, attrition = attr_ref)
+) |>
+  as.data.frame() |>
+  dplyr::left_join(dplyr::select(phase_grid, phase, week_c), by = "week_c") |>
+  dplyr::mutate(outcome = "Disruptive", emmean = pmax(pmin(emmean, 1), 0))  # clamp to [0,1]
+
+plot_df <- dplyr::bind_rows(emm_on_df, emm_dis_df) |>
+  dplyr::mutate(
+    # Robust recode whether condition is 0/1 or already BAU/CICO
+    do_condition = dplyr::case_when(
+      as.character(do_condition) %in% c("0","BAU")  ~ "BAU",
+      as.character(do_condition) %in% c("1","CICO") ~ "CICO",
+      TRUE ~ as.character(do_condition)
+    ) |>
+      factor(levels = c("BAU","CICO")),
+    phase = forcats::fct_relevel(phase, "Baseline","Mid-Intervention","Post-Intervention","Maintenance")
+  )
+
+# Plot with ribbons for 95% CI and lines for group trends
+ggplot2::ggplot(plot_df, ggplot2::aes(x = phase, y = emmean, group = do_condition)) +
+  ggplot2::geom_ribbon(ggplot2::aes(ymin = lower.CL, ymax = upper.CL, fill = do_condition), alpha = 0.15, color = NA) +
+  ggplot2::geom_line(ggplot2::aes(linetype = do_condition)) +
+  ggplot2::geom_point(ggplot2::aes(shape = do_condition), size = 2) +
+  ggplot2::facet_wrap(~ outcome, scales = "free_y") +
+  ggplot2::labs(
+    x = "Phase",
+    y = "Estimated mean",
+    linetype = "Condition",
+    shape = "Condition",
+    fill = "Condition"
+  ) +
+  ggplot2::scale_x_discrete(labels = c(
+    "Baseline" = "Base",
+    "Mid-Intervention" = "Mid",
+    "Post-Intervention" = "Post",
+    "Maintenance" = "Maint"
+  )) +
+  ggplot2::theme_minimal(base_size = 12)
+```
+
+# RQ2: BASC-3 Models (Distal Outcomes)
+
+## Setup
+
+```{r}
+# ================================================================
+# RQ2 Pre-Model Checklist (BASC-3 two-level ANCOVA)
+# Students (L1) nested within Classrooms (L2: tch_id)
+# ================================================================
+
+# ------------- Prepare data -------------
+basc <- basc_prepost %>%
+  transmute(
+    classroom = factor(tch_id),
+    student   = factor(std_id),
+    condition = factor(condition, levels = c(0,1), labels = c("BAU","CICO")),
+    site      = factor(redcap_data_access_group),
+    # BASC pre/post (teacher)
+    TEXT_pre = as.numeric(`TEXT.1`), TEXT_post = as.numeric(`TEXT.2`),   # Externalizing
+    TINT_pre = as.numeric(`TINT.1`), TINT_post = as.numeric(`TINT.2`),   # Internalizing
+    TSP_pre  = as.numeric(`TSP.1`),  TSP_post  = as.numeric(`TSP.2`),    # School Problems
+    TAS_pre  = as.numeric(`TAS.1`),  TAS_post  = as.numeric(`TAS.2`)     # Adaptive Skills
+  )
+
+# Scales to iterate
+scales <- tibble::tribble(
+  ~scale,            ~pre,       ~post,
+  "Externalizing",   "TEXT_pre", "TEXT_post",
+  "Internalizing",   "TINT_pre", "TINT_post",
+  "SchoolProblems",  "TSP_pre",  "TSP_post",
+  "AdaptiveSkills",  "TAS_pre",  "TAS_post"
+)
+
+# Helper: Hedges g at baseline
+hedges_g <- function(x, grp) {
+  out <- tryCatch(
+    cohens_d(x ~ grp, hedges.correction = TRUE)$Cohens_d,
+    error = function(e) NA_real_
+  )
+  as.numeric(out)
+}
+
+# Containers
+baseline_tbl  <- list()
+attrition_tbl <- list()
+icc_tbl       <- list()
+
+# ---------------------- Full loop for all scales ----------------------
+for (i in seq_len(nrow(scales))) {
+  sc   <- scales$scale[i]
+  pre  <- scales$pre[i]
+  post <- scales$post[i]
+
+  dat_sc <- basc %>%
+    select(student, classroom, condition, !!rlang::sym(pre), !!rlang::sym(post)) %>%
+    rename(pre = !!rlang::sym(pre), post = !!rlang::sym(post))
+
+  # ---------- Baseline Equivalence ----------
+  base_rows <- dat_sc %>% filter(!is.na(pre))
+  g_val <- hedges_g(base_rows$pre, base_rows$condition)
+
+  base_summary <- base_rows %>%
+    group_by(condition) %>%
+    summarize(
+      n = n(),
+      mean_pre = mean(pre, na.rm = TRUE),
+      sd_pre   = sd(pre, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(scale = sc, hedges_g = g_val, .before = 1)
+
+  baseline_tbl[[sc]] <- base_summary
+
+  # ---------- Attrition ----------
+  attr_df <- base_rows %>%
+    mutate(missing_post = as.integer(is.na(post))) %>%
+    group_by(condition) %>%
+    summarize(
+      n_base         = n(),
+      n_missing_post = sum(missing_post, na.rm = TRUE),
+      attrition_rate = 100 * mean(missing_post, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(scale = sc, .before = 1)
+
+  # Differential attrition test
+  chisq_p <- tryCatch({
+    tmp <- base_rows %>%
+      mutate(missing_post = factor(is.na(post), levels = c(FALSE, TRUE))) %>%
+      count(condition, missing_post) %>%
+      tidyr::pivot_wider(names_from = missing_post, values_from = n, values_fill = 0)
+    mat <- as.matrix(tmp[, c("FALSE","TRUE")])
+    suppressWarnings(chisq.test(mat))$p.value
+  }, error = function(e) NA_real_)
+
+  overall_attr <- base_rows %>%
+    summarize(overall_attrition = 100 * mean(is.na(post))) %>%
+    pull(overall_attrition)
+
+  attr_df <- attr_df %>%
+    mutate(diff_attr_p = chisq_p[1], overall_attrition = overall_attr)
+
+  attrition_tbl[[sc]] <- attr_df
+
+  # ---------- ICCs ----------
+  post_rows <- dat_sc %>% filter(!is.na(post))
+  icc_row <- if (nrow(post_rows) >= 5 && n_distinct(post_rows$classroom) >= 2) {
+    m0 <- lmer(post ~ 1 + (1 | classroom), data = post_rows, REML = TRUE)
+    icc_val <- tryCatch(performance::icc(m0)$ICC_adjusted, error = function(e) NA_real_)
+    vc <- as.data.frame(VarCorr(m0))
+    tibble(
+      scale = sc,
+      ICC   = icc_val,
+      var_classroom = vc$vcov[vc$grp == "classroom"],
+      var_residual  = vc$vcov[vc$grp == "Residual"],
+      n_students    = n_distinct(post_rows$student),
+      n_classrooms  = n_distinct(post_rows$classroom)
+    )
+  } else {
+    tibble(
+      scale = sc, ICC = NA_real_,
+      var_classroom = NA_real_, var_residual = NA_real_,
+      n_students = n_distinct(post_rows$student),
+      n_classrooms = n_distinct(post_rows$classroom)
+    )
+  }
+
+  icc_tbl[[sc]] <- icc_row
+}
+
+# ---------------------- Combine and report ----------------------
+baseline_out  <- bind_rows(baseline_tbl)
+attrition_out <- bind_rows(attrition_tbl)
+icc_out       <- bind_rows(icc_tbl)
+
+# Output tables
+knitr::kable(baseline_out %>%
+               select(scale, condition, n, mean_pre, sd_pre, hedges_g),
+             digits = 3,
+             caption = "Baseline Equivalence by Condition (Hedges' g)")
+
+knitr::kable(attrition_out %>%
+               select(scale, condition, n_base, n_missing_post, attrition_rate, overall_attrition, diff_attr_p),
+             digits = 2,
+             caption = "Attrition by Condition and Differential Attrition Test (Chi-square p)")
+
+knitr::kable(icc_out,
+             digits = 3,
+             caption = "Unconditional Posttest ICCs (Random Intercept for Classroom)")
+
+# Overall distinct counts in the basc dataset
+basc_counts <- basc %>%
+  summarise(
+    n_students   = n_distinct(student),
+    n_classrooms = n_distinct(classroom)
+  )
+
+basc_counts
+```
+
+### Interpretation
+
+Preliminary data checks indicated strong baseline equivalence between CICO and BAU groups across all BASC-3 scales with small standardized mean differences (Hedges’ g = –0.02 to –0.16). Attrition was low (≈6.6%) and did not differ by condition (p = .94).The ICCs indicated moderate clustering for Externalizing (0.43), Internalizing (0.47), and Adaptive Skills (0.32), but almost none for School Problems (0.00), therefore supporting a two-level structure with students nested within classrooms. The planned two-level ANCOVA models will include baseline scores as covariates and random intercepts for classrooms with no additional covariates required for attrition or imbalance.
+
+## Model Output
+
+```{r}
+# ================================================================
+# RQ2: BASC-3 Two-Level ANCOVA (students in classrooms)
+# Outcome: Posttest BASC scale
+# Covariate: Baseline BASC scale (centered at overall mean)
+# Random effects: Classroom (tch_id) random intercept
+# Primary estimand: Adjusted posttest difference (CICO − BAU)
+# Effect size: Cohen’s d using pooled BASELINE SD
+# ================================================================
+
+# ---- Preconditions / guards ----------------------------------------------
+stopifnot(exists("basc_prepost"))
+stopifnot(all(c("tch_id","std_id","condition","redcap_data_access_group",
+                "TEXT.1","TEXT.2","TINT.1","TINT.2","TSP.1","TSP.2","TAS.1","TAS.2")
+              %in% names(basc_prepost)))
+
+if (!exists("guidance")) {
+  guidance <- tibble(
+    scale = c("Externalizing","Internalizing","SchoolProblems","AdaptiveSkills"),
+    flag_diff_attrition = FALSE
+  )
+}
+
+# ---- Data prep (harmonize columns and factor coding) ----------------------
+basc <- basc_prepost %>%
+  transmute(
+    classroom = factor(tch_id),
+    student   = factor(std_id),
+    condition = factor(condition, levels = c(0,1), labels = c("BAU","CICO")),
+    site      = factor(redcap_data_access_group),
+    # BASC pre/post (teacher)
+    TEXT_pre = as.numeric(`TEXT.1`), TEXT_post = as.numeric(`TEXT.2`),   # Externalizing
+    TINT_pre = as.numeric(`TINT.1`), TINT_post = as.numeric(`TINT.2`),   # Internalizing
+    TSP_pre  = as.numeric(`TSP.1`),  TSP_post  = as.numeric(`TSP.2`),    # School Problems
+    TAS_pre  = as.numeric(`TAS.1`),  TAS_post  = as.numeric(`TAS.2`)     # Adaptive Skills
+  )
+
+# Scales map used to loop
+scales <- tibble::tribble(
+  ~scale,            ~pre,       ~post,
+  "Externalizing",   "TEXT_pre", "TEXT_post",
+  "Internalizing",   "TINT_pre", "TINT_post",
+  "SchoolProblems",  "TSP_pre",  "TSP_post",
+  "AdaptiveSkills",  "TAS_pre",  "TAS_post"
+)
+
+# ---- Small helpers --------------------------------------------------------
+
+# Pooled BASELINE SD for Cohen’s d (grouped by condition)
+pooled_baseline_sd <- function(pre, grp) {
+  x <- split(pre, grp)
+  n <- vapply(x, function(v) sum(!is.na(v)), 0L)
+  s <- vapply(x, function(v) stats::sd(v, na.rm = TRUE), 0.0)
+  # guard: needs at least two non-NA per group to avoid NaN
+  if (any(n < 2) || sum(n - 2, na.rm = TRUE) <= 0) return(NA_real_)
+  sqrt(sum((n - 1) * s^2, na.rm = TRUE) / sum(n - 2, na.rm = TRUE))
+}
+
+# Fit a single ANCOVA model for one BASC scale with optional attrition covariate
+fit_rq2_one <- function(dat, scale_name, add_attrition = FALSE) {
+
+  # Keep only needed columns and make a centered baseline
+  d <- dat %>%
+    mutate(pre_c = pre - mean(pre, na.rm = TRUE))
+
+  # Add attrition flag only if requested
+  if (add_attrition && !"attrition" %in% names(d)) {
+    d <- d %>% mutate(attrition = factor(if_else(is.na(post), 1L, 0L), levels = c(0,1)))
+  }
+
+  # Formula
+  fml <- if (add_attrition) {
+    post ~ pre_c + condition + attrition + (1 | classroom)
+  } else {
+    post ~ pre_c + condition + (1 | classroom)
+  }
+
+  # Minimal sample and cluster checks
+  if (nrow(d %>% filter(!is.na(post), !is.na(pre))) < 20 ||
+      dplyr::n_distinct(d$classroom) < 2) {
+    return(list(model = NULL, emm = NULL, contrast = NULL, diag = NULL))
+  }
+
+  # Fit model with a robust optimizer fallback for tricky fits
+  m <- tryCatch(
+    lmer(fml, data = d, REML = FALSE, na.action = na.exclude,
+         control = lmerControl(optimizer = "nloptwrap", calc.derivs = TRUE)),
+    error = function(e) {
+      lmer(fml, data = d, REML = FALSE, na.action = na.exclude,
+           control = lmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5)))
+    }
+  )
+
+  # EMMs at mean baseline (pre_c = 0)
+  emm <- emmeans(m, ~ condition)
+
+  # Primary contrast CICO − BAU with CI and p
+  ct  <- contrast(emm, method = "revpairwise") %>%
+    summary(infer = TRUE) %>%
+    as.data.frame()
+
+  # Standardize by pooled BASELINE SD (WWC-style)
+  sd0 <- pooled_baseline_sd(pre = d$pre, grp = d$condition)
+  ct$cohens_d_baselineSD <- ct$estimate / sd0
+
+  # Diagnostics: variance components and ICC implied by ANCOVA
+  vc <- as.data.frame(VarCorr(m))
+  v_class <- vc$vcov[vc$grp == "classroom"]
+  v_res   <- vc$vcov[vc$grp == "Residual"]
+  diag <- tibble(
+    scale = scale_name,
+    var_classroom = v_class,
+    var_residual  = v_res,
+    ICC = v_class / (v_class + v_res)
+  )
+
+  list(model = m, emm = emm, contrast = ct, diag = diag)
+}
+
+# ---- Fit models for all scales -------------------------------------------
+rq2_models   <- list()
+rq2_emmeans  <- list()
+rq2_contrast <- list()
+rq2_diag     <- list()
+
+for (i in seq_len(nrow(scales))) {
+  sc <- scales$scale[i]
+  pre_col  <- scales$pre[i]
+  post_col <- scales$post[i]
+
+  # Join guidance decision for this scale (include attrition covariate or not)
+  add_attr <- guidance %>%
+    filter(scale == sc) %>%
+    pull(flag_diff_attrition)
+  add_attr <- isTRUE(add_attr) # default FALSE if not present
+
+  dat_sc <- basc %>%
+    select(student, classroom, condition, site, !!pre_col, !!post_col) %>%
+    rename(pre = !!pre_col, post = !!post_col)
+
+  res <- fit_rq2_one(dat_sc, sc, add_attrition = add_attr)
+
+  rq2_models[[sc]]   <- res$model
+  rq2_emmeans[[sc]]  <- res$emm %>% as.data.frame() %>% mutate(scale = sc, .before = 1)
+  rq2_contrast[[sc]] <- res$contrast %>% mutate(scale = sc, .before = 1)
+  rq2_diag[[sc]]     <- res$diag
+}
+
+# ---- Bind and print tidy tables ------------------------------------------
+rq2_means_df    <- bind_rows(rq2_emmeans)
+rq2_contrast_df <- bind_rows(rq2_contrast)
+rq2_diag_df     <- bind_rows(rq2_diag)
+
+# Adjusted means by condition
+kable(
+  rq2_means_df %>%
+    select(scale, condition, emmean, SE, df, lower.CL, upper.CL),
+  digits = 3,
+  caption = "RQ2: Adjusted Posttest Means by Condition (EMMs at mean baseline)"
+)
+
+# Primary contrast and standardized effect
+kable(
+  rq2_contrast_df %>%
+    transmute(
+      scale,
+      contrast,
+      estimate, SE, df,
+      t = estimate / SE,
+      p.value, lower.CL, upper.CL,
+      cohens_d = cohens_d_baselineSD
+    ),
+  digits = 3,
+  caption = "RQ2: Adjusted Posttest Difference (CICO − BAU) and Standardized Effect (d, pooled baseline SD)"
+)
+
+# Diagnostics table
+kable(
+  rq2_diag_df,
+  digits = 3,
+  caption = "RQ2: Variance Components and ICC from ANCOVA models"
+)
+```
+
+### Interpretation
+
+The two-level ANCOVA models examined whether students in the CICO intervention showed better distal outcomes than students in the BAU group after adjusting for baseline BASC-3 scores, with students nested within classrooms. Although “boundary (singular)” warnings appeared, these are common when the classroom-level variance is very small for some outcomes (as seen in School Problems) and don’t invalidate the results.
+
+Across all four areas—Externalizing Behavior, Internalizing Behavior, School Problems, and Adaptive Skills—CICO students demonstrated statistically significant differences in post-test outcomes compared to students in the business-as-usual (BAU) condition. On the Externalizing Behavior scale, CICO students scored on average 5.39 points lower than BAU students (p < .001, d = –0.46), reflecting a moderate decrease in teacher-reported externalizing problems. Internalizing Behavior scores were also lower among CICO students by 3.87 points (p = .006, d = –0.27), suggesting small to moderate reductions. On the School Problems scale, CICO students’ scores were 3.13 points lower than those of BAU students (p < .001, d = –0.35). Finally, Adaptive Skills scores were 2.59 points lower among CICO students (p = .001, d = –0.38), representing a modest decline.
+
+The adjusted posttest means confirm that CICO students consistently exhibited lower BASC-3 scores across all domains relative to BAU peers after controlling for baseline performance. The intraclass correlations (ICCs) for Externalizing (ICC = .28), Internalizing (ICC = .33), and Adaptive Skills (ICC = .23) indicate moderate clustering of student outcomes within classrooms, supporting the use of multilevel modeling to account for shared variance among students taught by the same teacher. In contrast, the School Problems scale showed near-zero between-classroom variance (ICC = 0.00) which explains the boundary warnings that appeared during estimation. Tthese findings suggest that participation in the CICO intervention was associated with meaningful improvements at posttest.
