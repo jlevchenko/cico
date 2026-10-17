@@ -1,5 +1,12 @@
 # cico
 
+> **Note on data:** The student-level data used in this analysis are **not
+> included** in this repository. They are restricted under data use
+> agreements that protect student, teacher, and school confidentiality. The
+> code, rendered notebook, and slide deck are shared to show the analytic
+> approach; the analysis cannot be re-run without authorized access to the
+> source files.
+
 **Check-In/Check-Out (CICO) Data Analysis -- Multilevel Models of Direct Observation and BASC-3 Outcomes**
 
 This repository contains the R notebook, rendered report, and summary slide
@@ -48,7 +55,7 @@ cico/
 ├── CICO_Data_Analysis.Rmd            # Full analysis notebook (source)
 ├── CICO_Data_Analysis_nb.html        # Rendered HTML notebook (knit output)
 ├── CICO_Data_Analysis.pptx           # Summary slide deck for team/stakeholder review
-└── data/
+└── data/                             # Not included (restricted under data use agreements)
     ├── CICO-2021-22_DirectObs_students.sav
     ├── CICO-2022-23_DirectObs_students.sav
     ├── CICO-2023-24_DirectObs_students.sav
@@ -57,9 +64,8 @@ cico/
     └── BASC TRS combined across cohorts.sav
 ```
 
-> **Note on source data:** The SPSS (`.sav`) source files are not included in
-> this repository due to data use restrictions. Update `data_dir` in the
-> Import Data chunk of `CICO_Data_Analysis.Rmd` to point to your local copy.
+The `data/` folder is listed to show the file names the notebook expects. The
+SPSS (`.sav`) source files themselves are not included.
 
 ---
 
@@ -112,7 +118,7 @@ tables, diagnostics, and interpretation text.
 ## Usage
 
 1. Clone the repository
-2. Update `data_dir` in the Import Data chunk of `CICO_Data_Analysis.Rmd` to point to your local copy of the SDO and BASC-3 `.sav` files
+2. If you have authorized access to the SDO and BASC-3 `.sav` files, update `data_dir` in the Import Data chunk of `CICO_Data_Analysis.Rmd` to point to your local copy (the files are not included in this repository due to data use agreements)
 3. Knit the Rmd to HTML (or open as a notebook in RStudio and run all chunks)
 
 **R packages required:**
@@ -127,5 +133,5 @@ install.packages(c("dplyr", "tibble", "tidyr", "purrr", "stringr",
 
 ## Related Repositories
 
-- [`rep`](https://github.com/jlevchenko) -- Resilience Education Program (REP) 3.1/4.1 outcome analyses and power analysis
-- [`metrics`](https://github.com/jlevchenko) -- METRICS national TA center data pipelines (APR/IPR reporting, tier assignment, ROI analysis)
+- [`rep`](https://github.com/jlevchenko/rep) -- Resilience Education Program (REP) 3.1/4.1 outcome analyses and power analysis
+- [`metrics`](https://github.com/jlevchenko/metrics) -- METRICS national TA center data pipelines (APR/IPR reporting, tier assignment, ROI analysis)
